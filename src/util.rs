@@ -1,16 +1,13 @@
-use lazy_static::lazy_static;
-
+use std::io;
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-lazy_static! {
-    /// Represents a socket address with unspecified IPv4 address and unspecified
-    /// port.
-    pub(crate) static ref SOCKADDR_V4_ANY: SocketAddr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-    pub(crate) static ref SOCKADDR_V6_ANY: SocketAddr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-    pub(crate) static ref CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
-}
+use crate::segment::Segment;
+use crate::segment::SequenceNumber;
+
+pub(crate) const WINDOW_SIZE: SequenceNumber = 5;
 
 /// Macro cloning all given variables into a closure.
 ///
@@ -41,44 +38,55 @@ macro_rules! clone {
     }};
 }
 
-macro_rules! conn_does_not_exist {
-    () => { std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        "Client not connected"
-    ) }
+pub(crate) fn clone_io_err(err: &io::Error) -> io::Error {
+    io::Error::new(err.kind(), err.to_string())
 }
 
-macro_rules! conn_invalid_ack_segment {
-    () => { std::io::Error::new(
-        std::io::ErrorKind::NotFound,
+pub(crate) fn conn_invalid_ack_segment() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
         "Invalid acknowledgement segment sent by peer"
-    ) };
+    )
 }
 
-macro_rules! conn_reset_by_peer {
-    () => { std::io::Error::new(
-        std::io::ErrorKind::ConnectionReset,
+pub(crate) fn conn_reset_by_peer() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionReset,
         "Connection has been reset by peer"
-    ) }
+    )
 }
 
-macro_rules! conn_unexpected_segment {
-    ($s:expr) => { std::io::Error::new(
-        std::io::ErrorKind::BrokenPipe,
-        format!("Peer sent unexpected segment: {}", $s)
-    ) }
+pub(crate) fn conn_reset_local() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        "Connection has been reset locally"
+    )
 }
 
-macro_rules! conn_write_finished {
-    () => { std::io::Error::new(
-        std::io::ErrorKind::ConnectionAborted,
+pub(crate) fn conn_unexpected_segment(segment: &Segment) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        format!("Peer sent unexpected segment: {}", segment)
+    )
+}
+
+pub(crate) fn conn_write_finished() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
         "Sending data to peer has been already finished"
-    ) }
+    )
+}
+
+pub(crate) fn sock_addr_v4_any() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+}
+
+pub(crate) fn sock_addr_v6_any() -> SocketAddr {
+    SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+}
+
+pub(crate) fn conn_timeout() -> Duration {
+    Duration::from_secs(3)
 }
 
 pub(crate) use clone;
-pub(crate) use conn_does_not_exist;
-pub(crate) use conn_invalid_ack_segment;
-pub(crate) use conn_reset_by_peer;
-pub(crate) use conn_unexpected_segment;
-pub(crate) use conn_write_finished;

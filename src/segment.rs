@@ -1,8 +1,14 @@
+//! This is an internal module for segment represntation. Here you can find how
+//! exactly do MDSWP segments work.
+//! 
+//! For general information see [crate documentation](crate).
+
 use std::borrow::Borrow;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::fmt;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
+use std::fmt::Display;
 use std::fmt::Formatter;
 use std::io;
 use std::mem::size_of;
@@ -101,14 +107,14 @@ impl Segment {
     pub fn to_bytes(self) -> Vec<u8> {
         match self {
             Self::Establish { start_seq_num } =>
-                INSTR_CODE_ESTABLISH.to_be_bytes().into_iter()
-                    .chain(start_seq_num.to_be_bytes().into_iter())
+                INSTR_CODE_ESTABLISH.to_be_bytes().iter()
+                    .chain(start_seq_num.to_be_bytes().iter())
                     .map(|&b| b)
                     .collect(),
             Self::Reset => INSTR_CODE_RESET.to_be_bytes().to_vec(),
             Self::Acknowledge { seq_num } =>
-                INSTR_CODE_ACKNOWLEDGE.to_be_bytes().into_iter()
-                    .chain(seq_num.to_be_bytes().into_iter())
+                INSTR_CODE_ACKNOWLEDGE.to_be_bytes().iter()
+                    .chain(seq_num.to_be_bytes().iter())
                     .map(|&b| b)
                     .collect(),
             Self::Sequential { seq_num, variant } => match variant {

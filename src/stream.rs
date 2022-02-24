@@ -1,38 +1,47 @@
 //! Module for [`MdswpStream`](crate::MdswpStream) and its related data structures.
 
-use crate::util::clone;
-use crate::util::conn_invalid_ack_segment;
-use crate::util::conn_reset_by_peer;
-use crate::util::conn_unexpected_segment;
-use crate::util::conn_write_finished;
-use crate::util::CONNECTION_TIMEOUT;
-use crate::util::SOCKADDR_V4_ANY;
-use crate::util::SOCKADDR_V6_ANY;
-use crate::segment::MAX_DATA_LEN;
-use crate::segment::MAX_SEGMENT_LEN;
-use crate::segment::Segment;
-use crate::segment::SequenceNumber;
-use crate::segment::SequentialSegment;
-
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
-use std::convert::TryInto;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
-use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
 use rand::Rng;
 
-#[doc(hidden)]
-const WINDOW_SIZE: SequenceNumber = 5;
+use crate::segment::Segment;
+use crate::segment::SequenceNumber;
+use crate::segment::SequentialSegment;
+use crate::util::clone;
+use crate::util::clone_io_err;
+use crate::util::conn_reset_by_peer;
+use crate::util::conn_reset_local;
+use crate::util::conn_timeout;
+use crate::util::conn_unexpected_segment;
+use crate::util::sock_addr_v4_any;
+use crate::util::sock_addr_v6_any;
+use crate::MdswpListener;
+
+macro_rules! listener_bind_unreachable {
+    () => {
+        unreachable!(
+            "MdswpStream is still bound to the MdswpListener after resetting \
+        a connection"
+        )
+    };
+}
+
+macro_rules! conn_state_unreachable {
+    ($s:expr) => {
+        unreachable!("This state should be unreachable now: {:?}", $s)
+    };
+}
 
 /// A struct for communicating through the stream. This struct implements [`Read`] and [`Write`]
 /// like the standard [`TcpStream`].
@@ -41,34 +50,30 @@ const WINDOW_SIZE: SequenceNumber = 5;
 /// [`Write`]: std::io::Write
 /// [`TcpStream`]: std::net::TcpStream
 pub struct MdswpStream {
-    socket: UdpSocket,
     peer_addr: SocketAddr,
-    send_storage: RwLock<SendDataStorage>,
-    recv_storage: RwLock<RecvDataStorage>,
-    error: RwLock<io::Result<()>>,
-    send_thr: RwLock<Option<JoinHandle<()>>>,
-    recv_thr: RwLock<Option<JoinHandle<()>>>,
+    conn_state: RwLock<ConnState>,
+    send_timestamps: RwLock<VecDeque<(SequenceNumber, Option<Instant>)>>,
+    send_data: RwLock<BTreeMap<SequenceNumber, SequentialSegment>>,
+    recv_data: RwLock<BTreeMap<SequenceNumber, SequentialSegment>>,
+    listener: Arc<MdswpListener>,
+    thread: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl MdswpStream {
     #[doc(hidden)]
-    pub(crate) fn _new(
-        socket: UdpSocket,
-        peer_addr: SocketAddr,
-        local_win_start: SequenceNumber,
-        peer_win_start: SequenceNumber
-    ) -> Arc<Self> {
+    pub(crate) fn _new(listener: Arc<MdswpListener>, peer_addr: SocketAddr) -> Arc<Self> {
         let instance = Arc::new(Self {
-            socket,
             peer_addr,
-            send_storage: RwLock::new(SendDataStorage::new(local_win_start)),
-            recv_storage: RwLock::new(RecvDataStorage::new(peer_win_start)),
-            error: RwLock::new(Result::Ok(())),
-            send_thr: RwLock::new(Option::None),
-            recv_thr: RwLock::new(Option::None),
+            conn_state: RwLock::new(ConnState::NotConnected),
+            send_timestamps: RwLock::new(VecDeque::new()),
+            send_data: RwLock::new(BTreeMap::new()),
+            recv_data: RwLock::new(BTreeMap::new()),
+            listener,
+            thread: RwLock::new(Option::None),
         });
-        *instance.send_thr.write().unwrap() = Option::Some(thread::spawn(clone!(instance => || instance.__send_thread())));
-        *instance.recv_thr.write().unwrap() = Option::Some(thread::spawn(clone!(instance => || instance.__recv_thread())));
+        let weak = Arc::downgrade(&instance);
+        *instance.thread.write().unwrap() =
+            Option::Some(thread::spawn(clone!(weak => || __thread(weak))));
 
         instance
     }
@@ -85,21 +90,21 @@ impl MdswpStream {
     ///
     /// [`ToSocketAddrs`]: std::net::ToSocketAddrs
     pub fn connect<A>(addr: A) -> io::Result<Arc<Self>>
-        where
-            A: ToSocketAddrs
+    where
+        A: ToSocketAddrs,
     {
         // Evaluate the addresses
         let addrs = addr.to_socket_addrs()?;
         // Last error:
         let mut last_err = io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            "No socket address was provided"
+            "No socket address was provided",
         );
         // Try to connect to each address:
         for peer_addr in addrs {
             match Self::connect_to(peer_addr) {
                 Result::Ok(conn) => return Result::Ok(conn),
-                Result::Err(err) => last_err = err
+                Result::Err(err) => last_err = err,
             }
         }
         // If unsuccessful, return error given from last attempt.
@@ -125,7 +130,7 @@ impl MdswpStream {
         while attept_count != 0 {
             match Self::__try_single_connect_to(addr) {
                 Result::Ok(conn) => return Result::Ok(conn),
-                Result::Err(err) => last_err = Option::Some(err)
+                Result::Err(err) => last_err = Option::Some(err),
             }
             attept_count -= 1;
         }
@@ -136,180 +141,284 @@ impl MdswpStream {
 
     #[doc(hidden)]
     fn __try_single_connect_to(peer_addr: SocketAddr) -> io::Result<Arc<Self>> {
-        let mut buf = [0; MAX_SEGMENT_LEN];
-        // Assign unspecified local address according to the peer IP address version
+        // Determine local address
         let local_addr = match peer_addr {
-            SocketAddr::V4(..) => SOCKADDR_V4_ANY.clone(),
-            SocketAddr::V6(..) => SOCKADDR_V6_ANY.clone()
+            SocketAddr::V4(..) => sock_addr_v4_any(),
+            SocketAddr::V6(..) => sock_addr_v6_any(),
         };
-        // Generate random number where local window should start:
-        let local_win_start = rand::thread_rng().gen();
-        // Try to create a new UdpSocket:
-        let socket = UdpSocket::bind(local_addr)?;
-        socket.connect(peer_addr)?;
-        socket.set_broadcast(false)?;
-        socket.set_read_timeout(Option::Some(CONNECTION_TIMEOUT.clone()))?;
-        socket.set_write_timeout(Option::Some(CONNECTION_TIMEOUT.clone()))?;
-        // Send ESTABLISH and wait for response
-        let establish_segment = Segment::Establish { start_seq_num: local_win_start };
-        socket.send(&establish_segment.to_bytes())?;
-        let recv_len = socket.recv(&mut buf)?;
-        let segment = buf[..recv_len].try_into()?;
-        // Return value
-        match segment {
-            Segment::Reset => Result::Err(conn_reset_by_peer!()),
-            Segment::Sequential {
-                seq_num: peer_win_start,
-                variant: SequentialSegment::Accept
-            } => Result::Ok(Self::_new(socket, peer_addr, local_win_start, peer_win_start)),
-            other => {
-                socket.send(&Segment::Reset.to_bytes())?;
-                Result::Err(conn_unexpected_segment!(other))
-            }
+        // Create a listener
+        let listener = MdswpListener::bind(local_addr)?;
+        listener._connect_to(peer_addr)?;
+        // Establish a connection
+        let stream = MdswpStream::_new(listener, peer_addr);
+        stream.__establish_conn();
+        match stream.__get_conn_state() {
+            ConnState::Connected { .. } => Result::Ok(stream),
+            ConnState::Errored { error } => Result::Err(error),
+            ConnState::ResetByPeer => Result::Err(conn_reset_by_peer()),
+            other => unreachable!("This state should be unreachable: {:?}", other),
         }
     }
 
+
     /// Returns the socket address of the remote peer of this MDSWP connection.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        let err = self.error.read().unwrap();
-        match &*err {
-            Result::Ok(()) => Result::Ok(self.peer_addr),
-            Result::Err(err) => Result::Err(io::Error::new(err.kind(), err.to_string()))
+        match self.__get_conn_state() {
+            ConnState::Errored { error } => Result::Err(clone_io_err(&error)),
+            ConnState::ResetByPeer => Result::Err(conn_reset_by_peer()),
+            ConnState::ResetLocal => Result::Err(conn_reset_local()),
+            _ => Result::Ok(self.peer_addr),
         }
     }
 
     /// Returns the socket address of the local half of this TCP connection.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.listener.local_addr()
     }
 
     /// Finishes the write operation to the stream.
     pub fn finish_write(&self) -> io::Result<()> {
-        self.send_storage.write().unwrap().finish()
+        todo!()
     }
 
     /// Shuts down the connection by sending a [`Reset`](Segment::Reset) segment to
     /// the peer.
     ///
     /// Calling this function multiple times will result in an error.
-    pub fn reset(&mut self) -> io::Result<()> {
-        let mut err = self.error.write().unwrap();
-        match &*err {
-            Result::Ok(()) => {
-                *err = Result::Err(conn_reset_by_peer!());
-                Result::Ok(())
-            },
-            Result::Err(err) => Result::Err(io::Error::new(err.kind(), err.to_string()))
-        }
+    pub fn reset(&self) {
+        self.__set_conn_state(ConnState::ResetLocal);
+        self.send_data.write().unwrap().clear();
+        self.recv_data.write().unwrap().clear();
+        let _ = self.listener._send_to(self.peer_addr, &Segment::Reset.to_bytes());
     }
 
     /// Returns if the stream has errored.
     pub fn is_err(&self) -> bool {
-        self.error.read().unwrap().is_err()
+        match &*self.conn_state.read().unwrap() {
+            ConnState::NotConnected => false,
+            ConnState::EstablishSent { .. } => false,
+            ConnState::AcceptSent { .. } => false,
+            ConnState::Connected { .. } => false,
+            ConnState::ResetLocal => true,
+            ConnState::ResetByPeer => true,
+            ConnState::Errored { .. } => true,
+        }
+    }
+
+    /// Returns if the stream has errored.
+    pub fn err(&self) -> io::Result<()> {
+        match &*self.conn_state.read().unwrap() {
+            ConnState::NotConnected
+            | ConnState::EstablishSent { .. }
+            | ConnState::AcceptSent { .. }
+            | ConnState::Connected { .. } => Result::Ok(()),
+            ConnState::ResetLocal => Result::Err(conn_reset_local()),
+            ConnState::ResetByPeer => Result::Err(conn_reset_by_peer()),
+            ConnState::Errored { error } => {
+                Result::Err(io::Error::new(error.kind(), error.to_string()))
+            }
+        }
     }
 
     /// Returns if writing has been completed.
     pub fn is_write_finished(&self) -> bool {
-        self.send_storage.read().unwrap().has_finished()
+        todo!()
     }
 
     /// Returns if reading has been completed.
     pub fn is_read_finished(&self) -> bool {
-        self.recv_storage.read().unwrap().has_finished()
+        todo!()
     }
 
     /// Sets the TTL for the underlying UDP socket.
     pub fn set_ttl(&mut self, ttl: u32) -> io::Result<()> {
-        self.socket.set_ttl(ttl)
+        self.listener.set_ttl(ttl)
     }
 
     /// Gets the TTL for the underlying UDP socket.
     pub fn ttl(&self) -> io::Result<u32> {
-        self.socket.ttl()
+        self.listener.ttl()
     }
 
     #[doc(hidden)]
-    fn __error(&self, err: io::Error) {
-        *self.error.write().unwrap() = Result::Err(err);
+    pub(crate) fn _error(&self, error: io::Error) {
+        self.__set_conn_state(ConnState::Errored { error });
+        self.send_data.write().unwrap().clear();
+        self.recv_data.write().unwrap().clear();
+        let _ = self.listener._send_to(self.peer_addr, &Segment::Reset.to_bytes());
     }
 
     #[doc(hidden)]
-    fn __next_send_segment(&self) -> Option<Segment> {
+    pub(crate) fn _recv_segment(&self, segment: Segment) {
+        match segment {
+            Segment::Reset => self.__recv_reset(),
+            Segment::Establish { start_seq_num } => self.__recv_establish(start_seq_num),
+            Segment::Acknowledge { seq_num } => self.__recv_acknowledge(seq_num),
+            Segment::Sequential { seq_num, variant } => self.__recv_sequential(seq_num, variant),
+        }
+    }
+
+    #[doc(hidden)]
+    fn __recv_reset(&self) {
+        *self.conn_state.write().unwrap() = ConnState::ResetByPeer;
+    }
+
+    #[doc(hidden)]
+    fn __recv_establish(&self, start_seq_num: SequenceNumber) {
+        match self.__get_conn_state() {
+            // If we are disconnected
+            ConnState::NotConnected => self.__accept_conn(start_seq_num),
+            ConnState::EstablishSent { .. }
+            | ConnState::AcceptSent { .. }
+            | ConnState::Connected { .. } => {
+                self._error(conn_unexpected_segment(&Segment::Establish {
+                    start_seq_num,
+                }))
+            }
+            ConnState::ResetLocal | ConnState::ResetByPeer | ConnState::Errored { .. } => {
+                listener_bind_unreachable!()
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    fn __recv_acknowledge(&self, seq_num: SequenceNumber) {
         todo!()
     }
 
     #[doc(hidden)]
-    fn __recv_segment(&self, segment: Segment) {
-        match segment {
-            Segment::Reset => self.__error(conn_reset_by_peer!()),
-            Segment::Establish { .. } => todo!("Toto je chyba"),
-            Segment::Acknowledge { seq_num } => {
-                let mut send = self.send_storage.write().unwrap();
-                match send.register_acknowledge(seq_num) {
-                    Result::Ok(()) => {}
-                    Result::Err(err) => self.__error(err)
+    fn __recv_sequential(&self, seq_num: SequenceNumber, variant: SequentialSegment) {
+        self.__append_recv(seq_num, variant.clone());
+        if !self.is_err() {
+            match variant {
+                SequentialSegment::Accept => self.__recv_accept(seq_num),
+                SequentialSegment::Finish => self.__recv_finish(seq_num),
+                SequentialSegment::Data { .. } => {},
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    fn __append_recv(&self, seq_num: SequenceNumber, variant: SequentialSegment) {
+        self.__send_segment(Segment::Acknowledge { seq_num });
+        todo!("Check for existence and evantually compare the contents")
+    }
+
+    #[doc(hidden)]
+    fn __recv_accept(&self, seq_num: SequenceNumber) {
+        let (local_win, peer_win) = match self.__get_conn_state() {
+            // Accept segment can be received right after sending Establish:
+            ConnState::EstablishSent { local_win } => (local_win, Option::None),
+            // And when the Acknowledge segment was not received on first attempt,
+            // e.g. connected state and same sequence number
+            ConnState::Connected { local_win, peer_win, .. }
+            if peer_win == seq_num => (local_win, Option::Some(peer_win)),
+            // Anything else is invalid
+            _ => {
+                self._error(conn_unexpected_segment(&Segment::Sequential {
+                    variant: SequentialSegment::Accept,
+                    seq_num,
+                }));
+                return;
+            }
+        };
+    }
+
+    #[doc(hidden)]
+    fn __recv_finish(&self, seq_num: SequenceNumber) {
+        match self.__get_conn_state() {
+            // We can receive Finish only when we are connected
+            ConnState::Connected {
+                local_win,
+                peer_win,
+                local_finish,
+                peer_finish
+            } => match peer_finish {
+                // If Finish has been already received the sequence number of this
+                // and previous Finish segment must be the same
+                Option::Some(n) if n != seq_num
+                => self._error(conn_unexpected_segment(&Segment::Sequential {
+                    seq_num,
+                    variant: SequentialSegment::Finish
+                })),
+                // Change state to reflect the arrival of the Finish segment
+                _ => {
+                    let new_conn_state = ConnState::Connected {
+                        local_win,
+                        peer_win,
+                        local_finish,
+                        peer_finish: Option::Some(seq_num)
+                    };
+                    self.__set_conn_state(new_conn_state);
                 }
             },
-            Segment::Sequential { seq_num, variant } => {
-                let mut recv = self.recv_storage.write().unwrap();
-                match recv.recv_segment(seq_num, variant) {
-                    Result::Ok(()) => {},
-                    Result::Err(err) => self.__error(err)
-                }
+            // If we are not connected it must be a mistake
+            other => self._error(conn_unexpected_segment(
+                &Segment::Sequential { seq_num, variant: SequentialSegment::Finish }
+            )),
+        }
+    }
+
+    #[doc(hidden)]
+    fn __establish_conn(&self) {
+        let timeout = 2 * conn_timeout();
+        let start_seq_num = rand::thread_rng().gen();
+        let start = Instant::now();
+        self.__send_segment(Segment::Establish { start_seq_num });
+        while start.elapsed() < timeout {
+            match self.__get_conn_state() {
+                ConnState::Connected { .. } => return,
+                ConnState::ResetByPeer => return,
+                ConnState::Errored { .. } => return,
+                ConnState::ResetLocal => conn_state_unreachable!(ConnState::ResetLocal),
+                _ => thread::sleep(Duration::ZERO),
             }
         }
     }
 
     #[doc(hidden)]
-    fn __send_thread(self: Arc<Self>) {
-        while !self.is_err() {
-            match self.__next_send_segment() {
-                Option::Some(segment) => {
-                    let bytes = segment.to_bytes();
-                    match self.socket.send_to(&bytes, self.peer_addr) {
-                        Result::Ok(n) => assert_eq!(n, bytes.len()),
-                        Result::Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {},
-                        Result::Err(err) => self.__error(err),
-                    }
-                }
-                Option::None => thread::sleep(Duration::ZERO)
-            }
-        }
+    fn __get_conn_state(&self) -> ConnState {
+        self.conn_state.read().unwrap().clone()
     }
 
     #[doc(hidden)]
-    fn __recv_thread(self: Arc<Self>) {
-        let mut buf = [0; u16::MAX as usize];
+    fn __set_conn_state(&self, conn_state: ConnState) {
+        *self.conn_state.write().unwrap() = conn_state;
+    }
 
-        while !self.error.read().unwrap().is_err() {
-            let len = match self.socket.recv(&mut buf) {
-                Result::Ok(len) => len,
-                Result::Err(err) =>
-                    if err.kind() == io::ErrorKind::Interrupted { continue }
-                    else { self.__error(err); return; }
-            };
+    #[doc(hidden)]
+    fn __accept_conn(&self, peer_win: SequenceNumber) {
+        let local_win = rand::thread_rng().gen();
+        let new_conn_state = ConnState::AcceptSent {
+            local_win,
+            peer_win,
+        };
+        let accept_segment = Segment::Sequential {
+            seq_num: local_win,
+            variant: SequentialSegment::Accept,
+        };
 
-            match buf[0..len].try_into() {
-                Result::Ok(segment) => self.__recv_segment(segment),
-                Result::Err(err) => self.__error(conn_unexpected_segment!(err))
-            };
+        self.__send_segment(accept_segment);
+        self.__set_conn_state(new_conn_state);
+    }
 
-
-        }
+    #[doc(hidden)]
+    fn __send_segment(&self, segment: Segment) {
+        self.listener
+            ._send_to(self.peer_addr, &segment.to_bytes())
+            .unwrap_or_else(|error| self._error(error));
     }
 }
 
 impl Drop for MdswpStream {
     fn drop(&mut self) {
         let _ = self.reset();
-        self.send_thr.write().unwrap().take().unwrap().join().unwrap();
-        self.recv_thr.write().unwrap().take().unwrap().join().unwrap();
     }
 }
 
 impl Read for MdswpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.recv_storage.write().unwrap().read(buf)
+        todo!()
     }
 }
 
@@ -330,167 +439,81 @@ impl Write for MdswpStream {
     /// [`is_err`]: MdswpStream::is_err
     /// [`shutdown`]: MdswpStream::shutdown
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.send_storage.write().unwrap().write(buf)
+        todo!()
     }
 
     /// Flushes the stream, e.g. forces sending all remaining bytes even if there is
     /// small amount of data to be sent.
     fn flush(&mut self) -> io::Result<()> {
-        self.send_storage.write().unwrap().flush()
-    }
-}
-
-#[doc(hidden)]
-struct SendDataStorage {
-    buffer: Vec<u8>,
-    window: SequenceNumber,
-    data: VecDeque<(SequentialSegment, Option<Instant>)>,
-}
-
-impl SendDataStorage {
-    /// Creates a new instance of [`SendDataStorage`].
-    pub fn new(window_start: SequenceNumber) -> Self {
-        Self {
-            buffer: Vec::new(),
-            window: window_start,
-            data: VecDeque::new(),
-        }
-    }
-
-    /// Puts a [`Finish`] segment into the queue. After calling this function, cannot
-    /// send more data to peer.
-    ///
-    /// # Return value
-    ///
-    /// - [`Result::Ok`] if writing to the stream was not finished yet
-    /// - [`Result::Err`] otherwise
-    pub fn finish(&mut self) -> io::Result<()> {
-        if self.has_finished() {
-            Result::Err(conn_write_finished!())
-        } else {
-            self.__flush_unchecked();
-            self.data.push_back((SequentialSegment::Finish, Option::None));
-            Result::Ok(())
-        }
-    }
-
-    /// Registers the acknowledgement and slides the window.
-    pub fn register_acknowledge(&mut self, seq_num: SequenceNumber) -> io::Result<()> {
-        // Index in the queue
-        let index = seq_num.wrapping_sub(self.window);
-        let index_usize = index as usize;
-        // If index is out of range
-        if index >= WINDOW_SIZE || index_usize >= self.data.len() {
-            return Result::Err(conn_invalid_ack_segment!());
-        }
-        // Slide the window:
-        self.window = self.window.wrapping_add(index);
-        // Drain data that will not be sent again
-        self.data.drain(0..=index_usize);
-        Result::Ok(())
-    }
-
-    pub fn update_send_time(&mut self, seq_num: u8) -> io::Result<()> {
-        // Index in the queue
-        let index = seq_num.wrapping_sub(self.window);
-        let index_usize = index as usize;
-        // If index is out of range
-        if index >= WINDOW_SIZE || index_usize >= self.data.len() {
-            return Result::Err(conn_invalid_ack_segment!());
-        }
-        // Update send time:
-        self.data[index_usize].1 = Option::Some(Instant::now());
-        Result::Ok(())
-    }
-
-    /// Returns if the sending data has ended.
-    pub fn has_finished(&self) -> bool {
-        if self.data.is_empty() {
-            return false;
-        }
-        let last_segment = &self.data[self.data.len() - 1];
-        match last_segment.0 {
-            SequentialSegment::Finish => true,
-            SequentialSegment::Data { .. } => false,
-            SequentialSegment::Accept => unreachable!("Accept segment cannot occur here"),
-        }
-    }
-
-    fn __flush_unchecked(&mut self) {
-        let data = (&self.buffer[..]).try_into().unwrap();
-        self.data.push_back((SequentialSegment::Data { data }, Option::None));
-    }
-}
-
-impl Write for SendDataStorage {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.has_finished() {
-            Result::Err(conn_write_finished!())
-        } else {
-            self.buffer.extend(buf.into_iter());
-            while self.buffer.len() >= MAX_DATA_LEN {
-                let data = &self.buffer[0..MAX_DATA_LEN];
-                let data = data.try_into().unwrap();
-                self.data.push_back((SequentialSegment::Data { data }, Option::None));
-            }
-            Result::Ok(buf.len())
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.has_finished() {
-            Result::Err(conn_write_finished!())
-        } else {
-            self.__flush_unchecked();
-            Result::Ok(())
-        }
-    }
-}
-
-#[doc(hidden)]
-struct RecvDataStorage {
-    data: BTreeMap<SequenceNumber, SequentialSegment>,
-    window: (SequenceNumber, SequenceNumber),
-}
-
-impl RecvDataStorage {
-    pub fn new(window_start: SequenceNumber) -> Self {
-        let window_end = window_start.wrapping_add(WINDOW_SIZE);
-        Self {
-            data: BTreeMap::new(),
-            window: (window_start, window_end),
-        }
-    }
-
-    pub fn recv_segment(&mut self, seq_num: SequenceNumber, segment: SequentialSegment) -> io::Result<()> {
-        let (window_start, _) = self.window;
-        let diff = seq_num.overflowing_sub(window_start).0;
-
-        if diff >= WINDOW_SIZE {
-            return Result::Err(conn_invalid_ack_segment!());
-        }
-
-        if let Option::Some(curr_seg) = self.data.get(&seq_num) {
-            return if *curr_seg != segment {
-                Result::Err(conn_unexpected_segment!(
-                    "Segment sent more than once, last time with different content"
-                ))
-            } else {
-                Result::Ok(())
-            };
-        }
-
-        self.data.insert(seq_num, segment);
-        Result::Ok(())
-    }
-
-    pub fn has_finished(&self) -> bool {
         todo!()
     }
 }
 
-impl Read for RecvDataStorage {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+#[doc(hidden)]
+#[derive(Debug)]
+enum ConnState {
+    NotConnected,
+    EstablishSent {
+        local_win: SequenceNumber,
+    },
+    AcceptSent {
+        local_win: SequenceNumber,
+        peer_win: SequenceNumber,
+    },
+    Connected {
+        local_win: SequenceNumber,
+        local_finish: Option<SequenceNumber>,
+        peer_win: SequenceNumber,
+        peer_finish: Option<SequenceNumber>,
+    },
+    ResetByPeer,
+    ResetLocal,
+    Errored {
+        error: io::Error,
+    },
+}
+
+impl Clone for ConnState {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NotConnected => Self::NotConnected,
+            Self::EstablishSent { local_win } => Self::EstablishSent {
+                local_win: *local_win,
+            },
+            Self::AcceptSent {
+                local_win,
+                peer_win,
+            } => Self::AcceptSent {
+                local_win: *local_win,
+                peer_win: *peer_win,
+            },
+            Self::Connected {
+                local_win,
+                local_finish,
+                peer_win,
+                peer_finish,
+            } => Self::Connected {
+                local_win: *local_win,
+                local_finish: *local_finish,
+                peer_win: *peer_win,
+                peer_finish: *peer_finish,
+            },
+            Self::ResetByPeer => Self::ResetByPeer,
+            Self::ResetLocal => Self::ResetLocal,
+            Self::Errored { error } => Self::Errored {
+                error: clone_io_err(&error),
+            },
+        }
+    }
+}
+
+#[doc(hidden)]
+fn __thread(stream: Weak<MdswpStream>) {
+    loop {
+        let stream = match stream.upgrade() {
+            Option::None => return,
+            Option::Some(arc) => arc,
+        };
         todo!()
     }
 }

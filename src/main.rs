@@ -48,41 +48,49 @@
 pub mod listener;
 pub mod stream;
 
-#[doc(hidden)]
 mod segment;
+mod stream_storage;
 
 #[doc(hidden)]
 #[macro_use]
 mod util;
 
 use std::io;
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::thread;
+use std::io::{stdin, stdout, Write};
+use std::net::UdpSocket;
 
 pub use crate::listener::MdswpListener;
 pub use crate::stream::MdswpStream;
 
-fn main() -> thread::Result<()> {
-    let listener_thread = thread::spawn(listener_thread);
-    let client_thread = thread::spawn(client_thread);
-    let _ = listener_thread.join()?;
-    let _ = client_thread.join()?;
+fn main() -> io::Result<()> {
+    let mut buf = String::new();
+
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    println!("Created a socket local={}", socket.local_addr()?);
+    stdout().flush()?;
+    stdin().read_line(&mut buf)?;
+
+    socket.connect("192.168.1.1:12345")?;
+    println!("Bound socket to {}", socket.peer_addr()?);
+    stdout().flush()?;
+    stdin().read_line(&mut buf)?;
+
+    let socket2 = UdpSocket::bind("0.0.0.0:0")?;
+    println!("Created another socket local={}", socket2.local_addr()?);
+    stdout().flush()?;
+    stdin().read_line(&mut buf)?;
+
     Result::Ok(())
 }
 
-fn listener_thread() -> io::Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:12345")?;
-    println!("listener local: {:?}", listener.local_addr()?);
-    let (stream, _) = listener.accept()?;
-    println!("server local: {:?}", stream.local_addr()?);
-    println!("server remote: {:?}", stream.peer_addr()?);
-    Result::Ok(())
-}
 
-fn client_thread() -> io::Result<()> {
-    let stream = TcpStream::connect("127.0.0.1:12345")?;
-    println!("client local: {:?}", stream.local_addr()?);
-    println!("client remote: {:?}", stream.peer_addr()?);
-    Result::Ok(())
-}
+
+
+
+
+
+
+
+
+
+
