@@ -49,7 +49,7 @@ pub mod listener;
 pub mod stream;
 
 mod segment;
-mod stream_storage;
+mod storage;
 
 #[doc(hidden)]
 #[macro_use]

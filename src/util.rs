@@ -1,13 +1,13 @@
+use std::fmt::Display;
 use std::io;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::segment::Segment;
-use crate::segment::SequenceNumber;
+use crate::segment::SeqNumber;
 
-pub(crate) const WINDOW_SIZE: SequenceNumber = 5;
+pub(crate) const WINDOW_SIZE: SeqNumber = 5;
 
 /// Macro cloning all given variables into a closure.
 ///
@@ -42,10 +42,10 @@ pub(crate) fn clone_io_err(err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), err.to_string())
 }
 
-pub(crate) fn conn_invalid_ack_segment() -> io::Error {
+pub(crate) fn conn_invalid_seq_num(seq_num: SeqNumber) -> io::Error {
     io::Error::new(
-        io::ErrorKind::NotFound,
-        "Invalid acknowledgement segment sent by peer"
+        io::ErrorKind::BrokenPipe,
+        format!("Sent segment with invalid sequence number: {}", seq_num)
     )
 }
 
@@ -63,7 +63,15 @@ pub(crate) fn conn_reset_local() -> io::Error {
     )
 }
 
-pub(crate) fn conn_unexpected_segment(segment: &Segment) -> io::Error {
+pub(crate) fn conn_timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Peer did not respond"
+    )
+}
+
+pub(crate) fn conn_unexpected_segment<D>(segment: D) -> io::Error
+where D: Display {
     io::Error::new(
         io::ErrorKind::BrokenPipe,
         format!("Peer sent unexpected segment: {}", segment)
