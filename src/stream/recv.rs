@@ -72,7 +72,6 @@ impl RecvStorage {
             self.urgent_ack = true;
             return Result::Ok(());
         }
-        println!("recv seq_num={}, segment={:?}", seq_num, segment);
         // Otherwise continue in execution. Push the segment to the registry:
         self.segments.insert(seq_num, segment);
         // Update highest sequence number

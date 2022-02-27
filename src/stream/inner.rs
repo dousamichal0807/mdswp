@@ -243,7 +243,6 @@ impl StreamInner {
                 Option::None => thread::sleep(Duration::ZERO),
                 Option::Some(segment) => match segment {
                     SeqSegment::Finish => {
-                        println!("FINISH!!!");
                         *self.recv_finished.write().unwrap() = true
                     },
                     SeqSegment::Data { data } => stream_buf.append(&mut data.into_iter().collect()),

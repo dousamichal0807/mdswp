@@ -97,7 +97,6 @@ impl SendStorage {
         // to the back:
         if elapsed > (conn_timeout() / 2) {
             self.queue_sent.push_back((peek_seq_num, segment.clone(), Instant::now()));
-            println!("send seq_num={}, segment={:?}", peek_seq_num, &segment);
             Option::Some((peek_seq_num, segment))
         }
         // If the time did not elapse, push the segment to its original position
@@ -127,7 +126,6 @@ impl SendStorage {
         self.next_unsent = pop_unsent.wrapping_add(1);
         self.queue_sent.push_back((pop_unsent, pop_unsent_seg.clone(), Instant::now()));
         // Return value
-        println!("send seq_num={}, segment={:?}", pop_unsent, &pop_unsent_seg);
         Option::Some((pop_unsent, pop_unsent_seg))
     }
 
@@ -148,16 +146,5 @@ impl SendStorage {
                 .next().unwrap();
             *highest_seg == SeqSegment::Finish
         }
-    }
-
-    fn __debug(&self) {
-        let mut position = Option::None;
-        for index in 0..self.queue_unsent.len() {
-            let segment = &self.queue_unsent[index];
-            if *segment == SeqSegment::Accept {
-                position = Option::Some(index);
-            }
-        }
-        println!("Position of ACCEPT: {:?}", position);
     }
 }
