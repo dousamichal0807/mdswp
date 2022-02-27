@@ -54,56 +54,8 @@ mod segment;
 #[macro_use]
 mod util;
 
-use std::fs::File;
-use std::io;
-use std::io::Read;
-use std::io::Write;
-use std::thread;
-
 pub use crate::listener::MdswpListener;
 pub use crate::stream::MdswpStream;
-
-fn main() -> io::Result<()> {
-    let recv = thread::spawn(recv_thread);
-    let send = thread::spawn(send_thread);
-    recv.join().unwrap()?;
-    send.join().unwrap()
-}
-
-fn recv_thread() -> io::Result<()> {
-    let listener = MdswpListener::bind("0.0.0.0:12345")?;
-    let (mut stream, _) = listener.accept()?;
-    println!("connection accepted");
-    //stream.finish_write()?;
-    let mut received = Vec::new();
-    let mut buf = [0; 512];
-    while !stream.is_read_finished()? {
-        println!("Try read");
-        let len = stream.read(&mut buf)?;
-        received.extend_from_slice(&buf[..len]);
-    }
-    let mut expected = Vec::new();
-    let mut file = File::open("/usr/bin/bash")?;
-    file.read_to_end(&mut expected)?;
-    println!("Are they same? {}", expected == received);
-    let mut recvd_write = File::create("/tmp/recv")?;
-    recvd_write.write_all(&received)?;
-    Result::Ok(())
-}
-
-fn send_thread() -> io::Result<()> {
-    let mut buf = Vec::new();
-    let mut file = File::open("/usr/bin/bash")?;
-    file.read_to_end(&mut buf)?;
-    let mut stream = MdswpStream::connect("127.0.0.1:12345")?;
-    println!("Writing data");
-    stream.write_all(&buf)?;
-    println!("All data written");
-    println!("Finishing");
-    stream.finish_write()?;
-    println!("MAIN: send thread ends");
-    Result::Ok(())
-}
 
 
 
