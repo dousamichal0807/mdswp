@@ -267,7 +267,7 @@ impl MdswpListener {
             },
             Option::None => match data.try_into() {
                 Result::Ok(Segment::Establish { start_seq_num: establish_seq_num }) => {
-                    let accept_seq_num = 0; // TODO rand::thread_rng().gen();
+                    let accept_seq_num = rand::thread_rng().gen();
                     let conn = StreamInner::new_by_peer(self.clone(), addr, establish_seq_num, accept_seq_num);
                     self.connections.write().unwrap().insert(addr, Arc::downgrade(&conn));
                     self.to_accept.write().unwrap().push_back(conn.clone());

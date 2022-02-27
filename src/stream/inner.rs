@@ -130,7 +130,7 @@ impl StreamInner {
 
     fn __try_single_connect_to(peer_addr: SocketAddr) -> io::Result<Arc<Self>> {
         // Establish segment
-        let establish_seq_num = 128; // TODO rand::thread_rng().gen();
+        let establish_seq_num = rand::thread_rng().gen();
         let establish_seg = Segment::Establish { start_seq_num: establish_seq_num };
         // Create a listener
         let listener = MdswpListener::_new_for_single(peer_addr)?;
