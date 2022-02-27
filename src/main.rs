@@ -49,37 +49,59 @@ pub mod listener;
 pub mod stream;
 
 mod segment;
-mod storage;
 
 #[doc(hidden)]
 #[macro_use]
 mod util;
 
+use std::fs::File;
 use std::io;
-use std::io::{stdin, stdout, Write};
-use std::net::UdpSocket;
+use std::io::Read;
+use std::io::Write;
+use std::thread;
 
 pub use crate::listener::MdswpListener;
 pub use crate::stream::MdswpStream;
 
 fn main() -> io::Result<()> {
-    let mut buf = String::new();
+    let recv = thread::spawn(recv_thread);
+    let send = thread::spawn(send_thread);
+    recv.join().unwrap()?;
+    send.join().unwrap()
+}
 
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    println!("Created a socket local={}", socket.local_addr()?);
-    stdout().flush()?;
-    stdin().read_line(&mut buf)?;
+fn recv_thread() -> io::Result<()> {
+    let listener = MdswpListener::bind("0.0.0.0:12345")?;
+    let (mut stream, _) = listener.accept()?;
+    println!("connection accepted");
+    //stream.finish_write()?;
+    let mut received = Vec::new();
+    let mut buf = [0; 512];
+    while !stream.is_read_finished()? {
+        println!("Try read");
+        let len = stream.read(&mut buf)?;
+        received.extend_from_slice(&buf[..len]);
+    }
+    let mut expected = Vec::new();
+    let mut file = File::open("/usr/bin/bash")?;
+    file.read_to_end(&mut expected)?;
+    println!("Are they same? {}", expected == received);
+    let mut recvd_write = File::create("/tmp/recv")?;
+    recvd_write.write_all(&received)?;
+    Result::Ok(())
+}
 
-    socket.connect("192.168.1.1:12345")?;
-    println!("Bound socket to {}", socket.peer_addr()?);
-    stdout().flush()?;
-    stdin().read_line(&mut buf)?;
-
-    let socket2 = UdpSocket::bind("0.0.0.0:0")?;
-    println!("Created another socket local={}", socket2.local_addr()?);
-    stdout().flush()?;
-    stdin().read_line(&mut buf)?;
-
+fn send_thread() -> io::Result<()> {
+    let mut buf = Vec::new();
+    let mut file = File::open("/usr/bin/bash")?;
+    file.read_to_end(&mut buf)?;
+    let mut stream = MdswpStream::connect("127.0.0.1:12345")?;
+    println!("Writing data");
+    stream.write_all(&buf)?;
+    println!("All data written");
+    println!("Finishing");
+    stream.finish_write()?;
+    println!("MAIN: send thread ends");
     Result::Ok(())
 }
 

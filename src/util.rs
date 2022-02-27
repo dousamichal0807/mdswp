@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::io;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::segment::SeqNumber;
 
-pub(crate) const WINDOW_SIZE: SeqNumber = 5;
+pub(crate) const WINDOW_SIZE: SeqNumber = 10;
 
 /// Macro cloning all given variables into a closure.
 ///
@@ -42,10 +42,21 @@ pub(crate) fn clone_io_err(err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), err.to_string())
 }
 
-pub(crate) fn conn_invalid_seq_num(seq_num: SeqNumber) -> io::Error {
+pub(crate) fn conn_invalid_seq_num(
+    seq_num: SeqNumber,
+    lower_bound: SeqNumber,
+    upper_bound: SeqNumber
+) -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, format!(
+        "Received segment with invalid sequence number: {}; expected number in range [{}; {})",
+        seq_num, lower_bound, upper_bound
+    ))
+}
+
+pub(crate) fn conn_read_finished() -> io::Error {
     io::Error::new(
-        io::ErrorKind::BrokenPipe,
-        format!("Sent segment with invalid sequence number: {}", seq_num)
+        io::ErrorKind::UnexpectedEof,
+        "Peer has sent all data. No more data is available"
     )
 }
 
@@ -66,16 +77,31 @@ pub(crate) fn conn_reset_local() -> io::Error {
 pub(crate) fn conn_timed_out() -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
-        "Peer did not respond"
+        "Connection timed out"
     )
 }
 
-pub(crate) fn conn_unexpected_segment<D>(segment: D) -> io::Error
+pub(crate) fn conn_unexp_establish() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "Peer sent ESTABLISH segment in the middle of a connection"
+    )
+}
+
+pub(crate) fn conn_unexp_seg<D>(segment: D) -> io::Error
 where D: Display {
     io::Error::new(
         io::ErrorKind::BrokenPipe,
         format!("Peer sent unexpected segment: {}", segment)
     )
+}
+
+pub(crate) fn conn_unreliable<D>(actual: D, expected: D) -> io::Error
+where D: Debug {
+    io::Error::new(io::ErrorKind::BrokenPipe, format!(
+        "Expected to receive this: {:?}; but this was received: {:?}",
+        expected, actual
+    ))
 }
 
 pub(crate) fn conn_write_finished() -> io::Error {

@@ -4,6 +4,7 @@
 //! For general information see [crate documentation](crate).
 
 use std::borrow::Borrow;
+use std::cmp::min;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::fmt;
@@ -47,7 +48,7 @@ fn instr_code_of(segment: &[u8]) -> Option<InstrCode> {
 
 /// Returns the seqence number for given segment (byte sequence).
 fn seq_num_of(segment: &[u8]) -> Option<SeqNumber> {
-    let bytes = segment.get(RANGE_INSTR_CODE)?;
+    let bytes = segment.get(RANGE_SEQ_NUM)?;
     Option::Some(SeqNumber::from_be_bytes(bytes.try_into().unwrap()))
 }
 
@@ -104,7 +105,7 @@ pub(crate) enum Segment {
 }
 
 impl Segment {
-    pub fn to_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         match self {
             Self::Establish { start_seq_num } =>
                 INSTR_CODE_ESTABLISH.to_be_bytes().iter()
@@ -196,7 +197,7 @@ impl TryFrom<&[u8]> for Segment {
             INSTR_CODE_FINISH => if seq_num.is_some() && data.is_none() {
                 Result::Ok(Self::Sequential {
                     seq_num: seq_num.unwrap(),
-                    variant: SeqSegment::Accept,
+                    variant: SeqSegment::Finish,
                 })
             } else {
                 Result::Err(io::Error::new(
@@ -247,8 +248,11 @@ impl Debug for Segment {
             Self::Sequential { seq_num, variant } => match variant {
                 SeqSegment::Accept => write!(f, "ACCEPT (start_seq_num: {})", seq_num),
                 SeqSegment::Finish => write!(f, "FINISH (seq_num: {})", seq_num),
-                SeqSegment::Data { data } =>
-                    write!(f, "DATA (seq_num: {}, data: <{} bytes>)", seq_num, data.len()),
+                SeqSegment::Data { data } => {
+                    let len = min(data.len(), 10);
+                    write!(f, "DATA (seq_num: {}, data: <{} bytes> first {} bytes: {:?})",
+                           seq_num, data.len(), len, &data[..len])
+                }
             }
         }
     }
@@ -289,7 +293,11 @@ impl Debug for SeqSegment {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Accept => write!(f, "ACCEPT"),
-            Self::Data { data } => write!(f, "DATA (data: <{} bytes>)", data.len()),
+            Self::Data { data } => {
+                let len = min(data.len(), 10);
+                write!(f, "DATA ({} bytes total, first {} bytes: {:?})",
+                       data.len(), len, &data[..len])
+            }
             Self::Finish => write!(f, "FINISH")
         }
     }
@@ -338,19 +346,18 @@ impl DataSegment {
     pub fn len(&self) -> usize {
         self.data.len()
     }
-
-    /// Returns an iterator over the bytes of the data segment, which does not
-    /// consume the [`DataSegment`] instance itself.
-    pub fn iter(&self) -> std::slice::Iter<u8> {
-        (&self).into_iter()
-    }
 }
 
 impl TryFrom<&[u8]> for DataSegment {
     type Error = io::Error;
 
     fn try_from(data: &[u8]) -> io::Result<Self> {
-        if data.len() > MAX_DATA_LEN {
+        if data.is_empty() {
+            Result::Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No data"
+            ))
+        } else if data.len() > MAX_DATA_LEN {
             Result::Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Data too long",
@@ -389,14 +396,5 @@ impl IntoIterator for DataSegment {
 
     fn into_iter(self) -> Self::IntoIter {
         self.data.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a DataSegment {
-    type Item = &'a u8;
-    type IntoIter = std::slice::Iter<'a, u8>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.data.iter()
     }
 }

@@ -14,10 +14,15 @@ use std::sync::Weak;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-
+use rand::Rng;
 use crate::MdswpStream;
+
 use crate::segment::MAX_SEGMENT_LEN;
+use crate::segment::Segment;
+use crate::stream::inner::StreamInner;
 use crate::util::clone;
+use crate::util::sock_addr_v4_any;
+use crate::util::sock_addr_v6_any;
 
 /// A MDSWP socket, listening for connections.
 ///
@@ -30,8 +35,8 @@ use crate::util::clone;
 pub struct MdswpListener {
     socket: UdpSocket,
     thread: RwLock<Option<JoinHandle<()>>>,
-    connections: RwLock<HashMap<SocketAddr, Weak<MdswpStream>>>,
-    to_accept: RwLock<VecDeque<Arc<MdswpStream>>>,
+    connections: RwLock<HashMap<SocketAddr, Weak<StreamInner>>>,
+    to_accept: RwLock<VecDeque<Arc<StreamInner>>>,
     error: RwLock<io::Result<()>>,
 }
 
@@ -79,6 +84,22 @@ impl MdswpListener {
     pub fn bind<A>(addr: A) -> io::Result<Arc<Self>>
     where A: ToSocketAddrs {
         let socket = UdpSocket::bind(addr)?;
+        Self::__new(socket, true)
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn _new_for_single(peer_addr: SocketAddr) -> io::Result<Arc<Self>> {
+        let local_addr = match peer_addr {
+            SocketAddr::V4(..) => sock_addr_v4_any(),
+            SocketAddr::V6(..) => sock_addr_v6_any()
+        };
+        let socket = UdpSocket::bind(local_addr)?;
+        socket.connect(peer_addr)?;
+        Self::__new(socket, false)
+    }
+
+    #[doc(hidden)]
+    fn __new(socket: UdpSocket, start_thread: bool) -> io::Result<Arc<Self>> {
         let instance = Arc::new(Self {
             socket,
             thread: RwLock::new(Option::None),
@@ -86,9 +107,9 @@ impl MdswpListener {
             to_accept: RwLock::new(VecDeque::new()),
             error: RwLock::new(Result::Ok(())),
         });
-        let weak = Arc::downgrade(&instance);
-        let thread = thread::spawn(clone!(weak => || Self::__listen_thread(weak)));
-        *instance.thread.write().unwrap() = Option::Some(thread);
+        if start_thread {
+            instance._start_thread()?;
+        }
         Result::Ok(instance)
     }
 
@@ -110,10 +131,14 @@ impl MdswpListener {
     ///
     /// When established, the corresponding [`MdswpStream`] and the remote peer’s
     /// address will be returned.
-    pub fn accept_nonblocking(&self) -> io::Result<Option<(Arc<MdswpStream>, SocketAddr)>> {
+    pub fn accept_nonblocking(&self) -> io::Result<Option<(MdswpStream, SocketAddr)>> {
         match &*self.error.read().unwrap() {
             Result::Ok(()) => match self.to_accept.write().unwrap().pop_front() {
-                Option::Some(conn) => Result::Ok(Option::Some((conn.clone(), conn.peer_addr()?))),
+                Option::Some(conn) => {
+                    let addr = conn.peer_addr()?;
+                    let conn = MdswpStream(conn);
+                    Result::Ok(Option::Some((conn, addr)))
+                },
                 Option::None => Result::Ok(Option::None),
             },
             Result::Err(err) => Result::Err(io::Error::new(err.kind(), err.to_string()))
@@ -128,7 +153,7 @@ impl MdswpListener {
     ///
     /// When established, the corresponding [`MdswpStream`] and the remote peer’s
     /// address will be returned.
-    pub fn accept(&self) -> io::Result<(Arc<MdswpStream>, SocketAddr)> {
+    pub fn accept(&self) -> io::Result<(MdswpStream, SocketAddr)> {
         loop {
             match self.accept_nonblocking() {
                 Result::Ok(Option::None) => thread::sleep(Duration::ZERO),
@@ -152,13 +177,50 @@ impl MdswpListener {
     }
 
     #[doc(hidden)]
-    pub(crate) fn _connect_to(&self, addr: SocketAddr) -> io::Result<()> {
+    pub(crate) fn _start_thread(self: &Arc<Self>) -> io::Result<()> {
+        self.socket.set_nonblocking(false)?;
+        let weak = Arc::downgrade(&self);
+        let thread = thread::spawn(clone!(weak => || Self::__listen_thread(weak)));
+        *self.thread.write().unwrap() = Option::Some(thread);
+        Result::Ok(())
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn _add_connection(self: &Arc<Self>, peer_addr: SocketAddr, stream: Weak<StreamInner>) {
+        self.connections.write().unwrap().insert(peer_addr, stream);
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn _remove_connection(self: &Arc<Self>, peer_addr: SocketAddr) {
+        self.connections.write().unwrap().remove(&peer_addr);
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn _connect_listener_to(&self, addr: SocketAddr) -> io::Result<()> {
         self.socket.connect(addr)
     }
 
     #[doc(hidden)]
-    pub(crate) fn _send_to(&self, addr: SocketAddr, data: &[u8]) -> io::Result<()> {
-        self.socket.send_to(data, addr).and(Result::Ok(()))
+    pub(crate) fn _send_to(&self, addr: SocketAddr, segment: Segment) -> io::Result<()> {
+        self.socket.send_to(&segment.into_bytes(), addr).and(Result::Ok(()))
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn _try_recv(&self) -> io::Result<Option<Segment>> {
+        let mut buf = [0; MAX_SEGMENT_LEN + 1];
+        let len = match self.socket.recv(&mut buf[..]) {
+            Result::Ok(0) => return Result::Ok(Option::None),
+            Result::Ok(n) => n,
+            Result::Err(err) => return match err.kind() {
+                io::ErrorKind::Interrupted => Result::Ok(Option::None),
+                io::ErrorKind::WouldBlock => Result::Ok(Option::None),
+                _other => Result::Err(err)
+            }
+        };
+        match (&buf[..len]).try_into() {
+            Result::Ok(segment) => Result::Ok(Option::Some(segment)),
+            Result::Err(err) => Result::Err(err)
+        }
     }
 
     #[doc(hidden)]
@@ -180,34 +242,39 @@ impl MdswpListener {
             if this.is_err() { return; }
             // Try to receive a datagram:
             match this.socket.recv_from(&mut buf) {
-                Result::Err(err) => this.__error(err),
+                Result::Err(err) => match err.kind() {
+                    io::ErrorKind::Interrupted => {},
+                    io::ErrorKind::WouldBlock => unreachable!(),
+                    _other => this.__error(err),
+                }
                 Result::Ok((n, addr)) => this.__recv(&buf[..n], addr)
             }
         }
     }
 
     #[doc(hidden)]
-    fn __recv(self: Arc<Self>, data: &[u8], addr: SocketAddr) {
+    fn __recv(self: &Arc<Self>, data: &[u8], addr: SocketAddr) {
         // Try to get a connection
         let conn = match self.connections.read().unwrap().get(&addr) {
             Option::Some(weak) => weak.upgrade(),
             Option::None => Option::None
         };
         // If connection is not present yet, create a new one:
-        let mut conn = match conn {
-            Option::Some(conn) => conn,
-            Option::None => {
-                let new_conn = MdswpStream::_new(self.clone(), addr);
-                self.connections.write().unwrap()
-                    .insert(addr, Arc::downgrade(&new_conn));
-                new_conn
+        match conn {
+            Option::Some(conn) => match data.try_into() {
+                Result::Err(err) => conn.error(err, true),
+                Result::Ok(segment) => conn.recv_segment(segment),
+            },
+            Option::None => match data.try_into() {
+                Result::Ok(Segment::Establish { start_seq_num: establish_seq_num }) => {
+                    let accept_seq_num = 0; // TODO rand::thread_rng().gen();
+                    let conn = StreamInner::new_by_peer(self.clone(), addr, establish_seq_num, accept_seq_num);
+                    self.connections.write().unwrap().insert(addr, Arc::downgrade(&conn));
+                    self.to_accept.write().unwrap().push_back(conn.clone());
+                },
+                _other => { let _ = self._send_to(addr, Segment::Reset); },
             }
         };
-        // Acknowledge receive of a segment
-        match data.try_into() {
-            Result::Ok(segment) => conn._recv_segment(segment),
-            Result::Err(err) => conn._error(err)
-        }
     }
 }
 
@@ -232,7 +299,7 @@ impl Into<Arc<MdswpListener>> for Incoming {
 }
 
 impl Iterator for Incoming {
-    type Item = io::Result<(Arc<MdswpStream>, SocketAddr)>;
+    type Item = io::Result<(MdswpStream, SocketAddr)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Option::Some(self.listener.accept())
