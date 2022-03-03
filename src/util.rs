@@ -1,13 +1,15 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
+use std::fmt::Display;
 use std::io;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
+use std::num::Wrapping;
 use std::time::Duration;
 
-use crate::segment::SeqNumber;
+use crate::segment::SequenceNumber;
 
-pub(crate) const WINDOW_SIZE: SeqNumber = 10;
+pub(crate) const WINDOW_SIZE: SequenceNumber = Wrapping(10);
 
 /// Macro cloning all given variables into a closure.
 ///
@@ -26,7 +28,7 @@ pub(crate) const WINDOW_SIZE: SeqNumber = 10;
 /// let shared = Arc::new(some_value);
 /// let thread = thread::spawn( clone!(shared => move || {
 ///     // `shared` is cloned into the closure, NOT moved
-/// }))
+/// }));
 /// // This is possible:
 /// do_something(shared);
 /// ```
@@ -43,9 +45,9 @@ pub(crate) fn clone_io_err(err: &io::Error) -> io::Error {
 }
 
 pub(crate) fn conn_invalid_seq_num(
-    seq_num: SeqNumber,
-    lower_bound: SeqNumber,
-    upper_bound: SeqNumber
+    seq_num: SequenceNumber,
+    lower_bound: SequenceNumber,
+    upper_bound: SequenceNumber
 ) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, format!(
         "Received segment with invalid sequence number: {}; expected number in range [{}; {})",

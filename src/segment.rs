@@ -1,7 +1,63 @@
 //! This is an internal module for segment represntation. Here you can find how
-//! exactly do MDSWP segments work.
-//! 
+//! exactly MDSWP segments work.
+//!
 //! For general information see [crate documentation](crate).
+//!
+//! # Segments
+//!
+//! ```text
+//!                            +----------------+
+//!                            |  ALL SEGMENTS  |
+//!                            +----------------+
+//!                                     |
+//!                 +-------------------+-------------------+
+//!                 |                   |                   |
+//!        +-----------------+ +-----------------+ +-----------------+
+//!        |   Sequential    | |   Acknowledge   | | Non-sequential  |
+//!        +-----------------+ +-----------------+ +-----------------+
+//!                 |                                       |
+//!      +----------+----------+                     +------+------+
+//!      |          |          |                     |             |
+//! +--------+ +--------+ +--------+           +-----------+ +-----------+
+//! | Accept | | Finish | |  Data  |           | Establish | |   Reset   |
+//! +--------+ +--------+ +--------+           +-----------+ +-----------+
+//! ```
+//!
+//! Segment can be of several types. Segments are divided into two types: sequential
+//! and non-sequential. Successful transmission of sequential segment must be
+//! confirmed by the [`Acknowledge`] segment, whereas non-sequential are not
+//! *acknowledged*. [`Acknowledge`] segment is not acknowledged again since that
+//! would result in an *acknowledge storm*, but in the diagram above it is separated
+//! from non-sequential segments for its special meaning.
+//!
+//! To distinguish between segment types in the UDP datagram, each segment type is
+//! given a unique instruction code. Instruction code occupies the first byte in the
+//! segment. Put another way, segment type is determined by the first byte of the
+//! segment, where the instruction code is located.
+//!
+//! # Opening a connection
+//!
+//! Connection is established using [`Establish`] segment. The peer should respond
+//! with [`Accept`]. Since [`Accept`] is a sequential segment, [`Acknowledge`]
+//! segment should be sent as response. If peer wants do decline a connection
+//! [`Reset`] should be sent
+//!
+//! # Closing a connection
+//!
+//! TODO: FINISH segment, RESET segment
+//!
+//! # Sending data
+//!
+//! Data are sent using [`Data`] segment.
+//!
+//! TODO: DATA segment
+//!
+//! [`Accept`]:      SequentialSegment::Accept
+//! [`Acknowledge`]: Segment::Acknowledge
+//! [`Data`]:        SequentialSegment::Data
+//! [`Establish`]:   Segment::Establish
+//! [`Finish`]:      SequentialSegment::Finish
+//! [`Reset`]:       Segment::Reset
 
 use std::borrow::Borrow;
 use std::cmp::min;
@@ -13,6 +69,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::io;
 use std::mem::size_of;
+use std::num::Wrapping;
 use std::ops::Index;
 use std::ops::Range;
 use std::ops::RangeFrom;
@@ -22,16 +79,16 @@ use std::slice::SliceIndex;
 pub(crate) type InstrCode = u8;
 
 /// Type used as sequence number.
-pub(crate) type SeqNumber = u8;
+pub(crate) type SequenceNumber = Wrapping<u8>;
 
 /// Maximum length of the segment as [`usize`].
 pub(crate) const MAX_SEGMENT_LEN: usize = 512;
 
 /// Maximum length of carried data in [`DataSegment`].
-pub(crate) const MAX_DATA_LEN: usize = MAX_SEGMENT_LEN - (size_of::<InstrCode>() + size_of::<SeqNumber>());
+pub(crate) const MAX_DATA_LEN: usize = MAX_SEGMENT_LEN - (size_of::<InstrCode>() + size_of::<SequenceNumber>());
 
 const RANGE_INSTR_CODE: Range<usize> = 0..size_of::<InstrCode>();
-const RANGE_SEQ_NUM: Range<usize> = RANGE_INSTR_CODE.end..(RANGE_INSTR_CODE.end + size_of::<SeqNumber>());
+const RANGE_SEQ_NUM: Range<usize> = RANGE_INSTR_CODE.end..(RANGE_INSTR_CODE.end + size_of::<SequenceNumber>());
 const RANGE_DATA: RangeFrom<usize> = RANGE_SEQ_NUM.end..;
 const INSTR_CODE_RESET:       InstrCode = 0x00;
 const INSTR_CODE_ESTABLISH:   InstrCode = 0x01;
@@ -47,9 +104,9 @@ fn instr_code_of(segment: &[u8]) -> Option<InstrCode> {
 }
 
 /// Returns the seqence number for given segment (byte sequence).
-fn seq_num_of(segment: &[u8]) -> Option<SeqNumber> {
+fn seq_num_of(segment: &[u8]) -> Option<SequenceNumber> {
     let bytes = segment.get(RANGE_SEQ_NUM)?;
-    Option::Some(SeqNumber::from_be_bytes(bytes.try_into().unwrap()))
+    Option::Some(Wrapping(u8::from_be_bytes(bytes.try_into().unwrap())))
 }
 
 /// Returns user data carried in given segment (byte sequence).
@@ -74,7 +131,7 @@ pub(crate) enum Segment {
     Establish {
         /// Starting sequence number. Next sequential segment must have sequence number equal to
         /// `start_seq_num + 1`.
-        start_seq_num: SeqNumber
+        start_seq_num: SequenceNumber
     },
 
     /// [`Reset`] message is used to immediately stop communicating. After receiving [`Reset`], no
@@ -91,16 +148,16 @@ pub(crate) enum Segment {
     /// [`Sequential`]: Segment::Sequential
     Acknowledge {
         /// Sequence number of segment which should be acknowledged.
-        seq_num: SeqNumber
+        seq_num: SequenceNumber
     },
 
     /// This variant is for segments that should be acknowledged. Contains sequential number
     /// and the variant of the [`SequentialSegment`].
     Sequential {
         /// Sequence number of the segment.
-        seq_num: SeqNumber,
+        seq_num: SequenceNumber,
         /// The actual message carried inside the segment. For variants see [`SequentialSegment`].
-        variant: SeqSegment,
+        variant: SequentialSegment,
     },
 }
 
@@ -109,27 +166,27 @@ impl Segment {
         match self {
             Self::Establish { start_seq_num } =>
                 INSTR_CODE_ESTABLISH.to_be_bytes().iter()
-                    .chain(start_seq_num.to_be_bytes().iter())
+                    .chain(start_seq_num.0.to_be_bytes().iter())
                     .map(|&b| b)
                     .collect(),
             Self::Reset => INSTR_CODE_RESET.to_be_bytes().to_vec(),
             Self::Acknowledge { seq_num } =>
                 INSTR_CODE_ACKNOWLEDGE.to_be_bytes().iter()
-                    .chain(seq_num.to_be_bytes().iter())
+                    .chain(seq_num.0.to_be_bytes().iter())
                     .map(|&b| b)
                     .collect(),
             Self::Sequential { seq_num, variant } => match variant {
-                SeqSegment::Accept =>
+                SequentialSegment::Accept =>
                     INSTR_CODE_ACCEPT.to_be_bytes().to_vec().into_iter()
-                        .chain(seq_num.to_be_bytes())
+                        .chain(seq_num.0.to_be_bytes())
                         .collect(),
-                SeqSegment::Finish =>
+                SequentialSegment::Finish =>
                     INSTR_CODE_FINISH.to_be_bytes().to_vec().into_iter()
-                        .chain(seq_num.to_be_bytes())
+                        .chain(seq_num.0.to_be_bytes())
                         .collect(),
-                SeqSegment::Data { data } =>
+                SequentialSegment::Data { data } =>
                     INSTR_CODE_DATA.to_be_bytes().to_vec().into_iter()
-                        .chain(seq_num.to_be_bytes())
+                        .chain(seq_num.0.to_be_bytes())
                         .chain(data.into_iter())
                         .collect()
             }
@@ -185,7 +242,7 @@ impl TryFrom<&[u8]> for Segment {
             INSTR_CODE_ACCEPT => if seq_num.is_some() && data.is_none() {
                 Result::Ok(Self::Sequential {
                     seq_num: seq_num.unwrap(),
-                    variant: SeqSegment::Accept,
+                    variant: SequentialSegment::Accept,
                 })
             } else {
                 Result::Err(io::Error::new(
@@ -197,7 +254,7 @@ impl TryFrom<&[u8]> for Segment {
             INSTR_CODE_FINISH => if seq_num.is_some() && data.is_none() {
                 Result::Ok(Self::Sequential {
                     seq_num: seq_num.unwrap(),
-                    variant: SeqSegment::Finish,
+                    variant: SequentialSegment::Finish,
                 })
             } else {
                 Result::Err(io::Error::new(
@@ -220,7 +277,7 @@ impl TryFrom<&[u8]> for Segment {
             INSTR_CODE_DATA => if seq_num.is_some() && data.is_some() {
                 Result::Ok(Self::Sequential {
                     seq_num: seq_num.unwrap(),
-                    variant: SeqSegment::Data { data: data.unwrap() },
+                    variant: SequentialSegment::Data { data: data.unwrap() },
                 })
             } else {
                 Result::Err(io::Error::new(
@@ -243,12 +300,11 @@ impl Debug for Segment {
             Self::Establish { start_seq_num } =>
                 write!(f, "ESTABLISH (start_seq_num: {})", start_seq_num),
             Self::Reset => write!(f, "RESET"),
-            Self::Acknowledge { seq_num } =>
-                write!(f, "ACKNOWLEDGE (seq_num: {})", seq_num),
+            Self::Acknowledge { seq_num } => write!(f, "ACKNOWLEDGE (seq_num: {})", seq_num),
             Self::Sequential { seq_num, variant } => match variant {
-                SeqSegment::Accept => write!(f, "ACCEPT (start_seq_num: {})", seq_num),
-                SeqSegment::Finish => write!(f, "FINISH (seq_num: {})", seq_num),
-                SeqSegment::Data { data } => {
+                SequentialSegment::Accept => write!(f, "ACCEPT (start_seq_num: {})", seq_num),
+                SequentialSegment::Finish => write!(f, "FINISH (seq_num: {})", seq_num),
+                SequentialSegment::Data { data } => {
                     let len = min(data.len(), 10);
                     write!(f, "DATA (seq_num: {}, data: <{} bytes> first {} bytes: {:?})",
                            seq_num, data.len(), len, &data[..len])
@@ -265,7 +321,7 @@ impl Display for Segment {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) enum SeqSegment {
+pub(crate) enum SequentialSegment {
     /// [`Accept`] message is used to accept incoming connection. [`Accept`] should be sent only
     /// after receiving [`Establish`]. Successful receive of [`Accept`] must be always acknowledged.
     /// After acknowledging [`Accept`], both sides can send data. See [`Acknowledge`] for more
@@ -289,7 +345,7 @@ pub(crate) enum SeqSegment {
     },
 }
 
-impl Debug for SeqSegment {
+impl Debug for SequentialSegment {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Accept => write!(f, "ACCEPT"),

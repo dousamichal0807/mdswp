@@ -14,18 +14,20 @@ use std::time::Instant;
 
 use rand::Rng;
 
+use crate::listener::inner::ListenerInner;
 use crate::segment::MAX_DATA_LEN;
 use crate::segment::Segment;
-use crate::segment::SeqNumber;
-use crate::segment::SeqSegment;
-use crate::util::{clone, conn_read_finished, conn_unexp_establish};
+use crate::segment::SequenceNumber;
+use crate::segment::SequentialSegment;
+use crate::util::clone;
+use crate::util::conn_read_finished;
+use crate::util::conn_unexp_establish;
 use crate::util::clone_io_err;
 use crate::util::conn_reset_by_peer;
 use crate::util::conn_reset_local;
 use crate::util::conn_timed_out;
 use crate::util::conn_timeout;
 use crate::util::conn_unexp_seg;
-use crate::MdswpListener;
 
 use super::recv::RecvStorage;
 use super::send::SendStorage;
@@ -39,16 +41,16 @@ pub(crate) struct StreamInner {
     recv_buffer: RwLock<Vec<u8>>,
     recv_storage: RwLock<RecvStorage>,
     recv_finished: RwLock<bool>,
-    listener: Arc<MdswpListener>,
+    listener: Arc<ListenerInner>,
     thread: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl StreamInner {
     pub(crate) fn new_by_peer(
-        listener: Arc<MdswpListener>,
+        listener: Arc<ListenerInner>,
         peer_addr: SocketAddr,
-        establish_seq_num: SeqNumber,
-        accept_seq_num: SeqNumber
+        establish_seq_num: SequenceNumber,
+        accept_seq_num: SequenceNumber
     ) -> Arc<Self> {
         let instance = Arc::new(Self {
             peer_addr,
@@ -63,15 +65,16 @@ impl StreamInner {
             thread: RwLock::new(Option::None),
         });
         let weak = Arc::downgrade(&instance);
-        *instance.thread.write().unwrap() = Option::Some(thread::spawn(clone!(weak => || __thread(weak))));
+        *instance.thread.write().unwrap() = Option::Some(thread::spawn(
+            clone!(weak => || __thread(weak))));
         instance
     }
 
     pub(crate) fn new_by_local(
-        listener: Arc<MdswpListener>,
+        listener: Arc<ListenerInner>,
         peer_addr: SocketAddr,
-        establish_seq_num: SeqNumber,
-        accept_seq_num: SeqNumber
+        establish_seq_num: SequenceNumber,
+        accept_seq_num: SequenceNumber
     ) -> Arc<Self> {
         let instance = Arc::new(Self {
             peer_addr,
@@ -86,7 +89,8 @@ impl StreamInner {
             thread: RwLock::new(Option::None),
         });
         let weak = Arc::downgrade(&instance);
-        *instance.thread.write().unwrap() = Option::Some(thread::spawn(clone!(weak => || __thread(weak))));
+        *instance.thread.write().unwrap() = Option::Some(thread::spawn(
+            clone!(weak => || __thread(weak))));
         instance
     }
 
@@ -133,7 +137,7 @@ impl StreamInner {
         let establish_seq_num = rand::thread_rng().gen();
         let establish_seg = Segment::Establish { start_seq_num: establish_seq_num };
         // Create a listener
-        let listener = MdswpListener::_new_for_single(peer_addr)?;
+        let listener = ListenerInner::_new_for_single(peer_addr)?;
         listener._send_to(peer_addr, establish_seg)?;
         let start = Instant::now();
         // Wait for accept:
@@ -147,7 +151,7 @@ impl StreamInner {
                     Segment::Reset => Result::Err(conn_reset_by_peer()),
                     Segment::Sequential {
                         seq_num: accept_seq_num,
-                        variant: SeqSegment::Accept
+                        variant: SequentialSegment::Accept
                     } => {
                         let stream = StreamInner::new_by_local(
                             listener.clone(), peer_addr, establish_seq_num, accept_seq_num);
@@ -182,7 +186,7 @@ impl StreamInner {
         while send_buf.len() >= MAX_DATA_LEN {
             let bytes: Vec<u8> = send_buf.drain(..MAX_DATA_LEN).into_iter().collect();
             let data = bytes[..].try_into().unwrap();
-            self.send_storage.write().unwrap().push(SeqSegment::Data { data })?;
+            self.send_storage.write().unwrap().push(SequentialSegment::Data { data })?;
         }
         Result::Ok(buf.len())
     }
@@ -194,15 +198,15 @@ impl StreamInner {
             let n = min(MAX_DATA_LEN, send_buf.len());
             let bytes: Vec<u8> = send_buf.drain(..n).into_iter().collect();
             let data = bytes[..].try_into().unwrap();
-            self.send_storage.write().unwrap().push(SeqSegment::Data { data })?;
+            self.send_storage.write().unwrap().push(SequentialSegment::Data { data })?;
         }
         Result::Ok(())
     }
 
     pub(crate) fn finish_write(&self) -> io::Result<()> {
-        self.stream_state()?;
+        self.flush()?;
         let mut send_storage = self.send_storage.write().unwrap();
-        let result = send_storage.push(SeqSegment::Finish);
+        let result = send_storage.push(SequentialSegment::Finish);
         drop(send_storage);
         match result {
             Result::Ok(_) => {
@@ -242,11 +246,11 @@ impl StreamInner {
             match segment {
                 Option::None => thread::sleep(Duration::ZERO),
                 Option::Some(segment) => match segment {
-                    SeqSegment::Finish => {
+                    SequentialSegment::Finish => {
                         *self.recv_finished.write().unwrap() = true
                     },
-                    SeqSegment::Data { data } => stream_buf.append(&mut data.into_iter().collect()),
-                    SeqSegment::Accept => println!("WARNING! ACCEPT segment cannot be popped"),
+                    SequentialSegment::Data { data } => stream_buf.append(&mut data.into_iter().collect()),
+                    SequentialSegment::Accept => println!("WARNING! ACCEPT segment cannot be popped"),
                 }
             }
         }
@@ -322,7 +326,7 @@ impl StreamInner {
         }
     }
 
-    fn __recv_acknowledge(&self, seq_num: SeqNumber) {
+    fn __recv_acknowledge(&self, seq_num: SequenceNumber) {
         let mut send_storage = self.send_storage.write().unwrap();
         match send_storage.acknowledge(seq_num) {
             Result::Err(error) => {
@@ -332,7 +336,7 @@ impl StreamInner {
         }
     }
 
-    fn __recv_sequential(&self, seq_num: SeqNumber, variant: SeqSegment) {
+    fn __recv_sequential(&self, seq_num: SequenceNumber, variant: SequentialSegment) {
         let mut recv_storage = self.recv_storage.write().unwrap();
         let result = recv_storage.recv(seq_num, variant);
         drop(recv_storage);
