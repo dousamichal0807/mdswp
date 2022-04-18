@@ -140,7 +140,7 @@ impl RecvStorage {
         let max_offset = upper_bound - self.lower_bound;
         // Distance of given sequence number from lower bound is inclusive:
         let offset = seq_num - self.lower_bound;
-        // That means, in condition below, there cannot be 'less or equal'.
+        // That means, in condition below, there cannot be 'less or equal' operator.
         match offset < max_offset {
             true => Result::Ok(()),
             false => Result::Err(conn_invalid_seq_num(seq_num, self.lower_bound, upper_bound))
@@ -148,11 +148,11 @@ impl RecvStorage {
     }
 
     fn __check_presence_of(&self, seq_num: SequenceNumber, segment: &SequentialSegment) -> io::Result<bool> {
-        // Is given sequence number present
+        // Is given sequence number present?
         match self.segments.get(&seq_num) {
-            // If yes check the contents:
+            // If yes, check the contents:
             Option::Some(expected) => return
-                // If they are same, return it is already present
+                // If they are same, return that it is already present
                 if segment == expected { Result::Ok(true) }
                 // If they are different, that's an error:
                 else { Result::Err(conn_unreliable(segment, expected)) },

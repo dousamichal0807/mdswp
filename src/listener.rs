@@ -68,11 +68,30 @@ impl MdswpListener {
         Result::Ok(Self(ListenerInner::bind(addr)?))
     }
 
+    /// Creates an [`Incoming`] struct from the [`MdswpListener`]. Usage of this method should be
+    /// done in a `for` loop; see example below.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mdswp::MdswpListener;
+    /// use std::io;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let listener = MdswpListener::bind(some_address)?;
+    ///     // Infinitely listen for incoming connections:
+    ///     for connection in listener.incoming() {
+    ///         // do something useful here...
+    ///     }
+    ///     // Return value:
+    ///     Result::Ok(())
+    /// }
+    /// ```
     pub fn incoming(self) -> Incoming {
         self.into()
     }
 
-    /// Returns if the listener has been shutdown by an unexpected error.
+    /// Returns if the listener has been shut down by an unexpected error.
     pub fn is_err(&self) -> bool {
         self.0.is_err()
     }
@@ -85,6 +104,7 @@ impl MdswpListener {
         self.0.listener_state()
     }
 
+    /// Returns local address of the underlying UDP socket.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.0.local_addr()
     }
@@ -140,12 +160,14 @@ pub struct Incoming {
 }
 
 impl From<MdswpListener> for Incoming {
+    /// Creates [`Incoming`] instance from given [`MdswpListener`]
     fn from(listener: MdswpListener) -> Self {
         Self { listener }
     }
 }
 
 impl Into<MdswpListener> for Incoming {
+    /// Unwraps inner [`MdswpListener`] from given [`Incoming`] struct.
     fn into(self) -> MdswpListener {
         self.listener
     }
@@ -154,6 +176,12 @@ impl Into<MdswpListener> for Incoming {
 impl Iterator for Incoming {
     type Item = io::Result<(MdswpStream, SocketAddr)>;
 
+    /// Returns the next connection that was established by peer. This implementation blocks thread
+    /// execution until some connection is established.
+    ///
+    /// # Return value
+    ///
+    /// [`Option::Some`] containing a new connection.
     fn next(&mut self) -> Option<Self::Item> {
         Option::Some(self.listener.accept())
     }

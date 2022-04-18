@@ -1,4 +1,4 @@
-//! This crate implements a SWP (sliding window protocol). MDSWPl is built on top of
+//! This crate implements a SWP (sliding window protocol). MDSWP is built on top of
 //! the UDP (User Datagram Protocol).
 //!
 //! MDSWP calls its own PDUs *segments*. See [`segment`] to learn how MDSWP works

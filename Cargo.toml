@@ -1,10 +1,13 @@
 [package]
 name = "mdswp"
-version = "0.1.0"
-authors = ["dousamichal0807 <dousamichal0807 at seznam dot cz>"]
+version = "0.2.0"
+authors = ["dousamichal0807 <dousamichal0807@seznam.cz>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "A simple sliding window protocol written in Rust using UDP under the hood."
+readme = "README.md"
+repository = "https://github.com/dousamichal0807/mdswp"
+license = "GNU GPL v3 or later"
+license-file = "LICENSE"
 
 [dependencies]
 lazy_static = "1.4.0"
